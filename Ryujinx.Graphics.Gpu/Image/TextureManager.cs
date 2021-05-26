@@ -198,6 +198,27 @@ namespace Ryujinx.Graphics.Gpu.Image
         }
 
         /// <summary>
+        /// Sets the render target depth-stencil buffer.
+        /// </summary>
+        /// <param name="depthStencil">The depth-stencil buffer texture</param>
+        /// <returns>True if render target scale must be updated.</returns>
+        public bool SetRenderTargetDepthStencil(Texture depthStencil)
+        {
+            bool hasValue = depthStencil != null;
+            bool changesScale = (hasValue != (_rtDepthStencil != null)) || (hasValue && RenderTargetScale != depthStencil.ScaleFactor);
+
+            if (_rtDepthStencil != depthStencil)
+            {
+                _rtDepthStencil?.SignalModifying(false);
+                depthStencil?.SignalModifying(true);
+
+                _rtDepthStencil = depthStencil;
+            }
+
+            return changesScale || (hasValue && depthStencil.ScaleMode != TextureScaleMode.Blacklisted && depthStencil.ScaleFactor != GraphicsConfig.ResScale);
+        }
+
+        /// <summary>
         /// Gets the first available bound colour target, or the depth stencil target if not present.
         /// </summary>
         /// <returns>The first bound colour target, otherwise the depth stencil target</returns>
@@ -291,27 +312,6 @@ namespace Ryujinx.Graphics.Gpu.Image
         }
 
         /// <summary>
-        /// Sets the render target depth-stencil buffer.
-        /// </summary>
-        /// <param name="depthStencil">The depth-stencil buffer texture</param>
-        /// <returns>True if render target scale must be updated.</returns>
-        public bool SetRenderTargetDepthStencil(Texture depthStencil)
-        {
-            bool hasValue = depthStencil != null;
-            bool changesScale = (hasValue != (_rtDepthStencil != null)) || (hasValue && RenderTargetScale != depthStencil.ScaleFactor);
-
-            if (_rtDepthStencil != depthStencil)
-            {
-                _rtDepthStencil?.SignalModifying(false);
-                depthStencil?.SignalModifying(true);
-
-                _rtDepthStencil = depthStencil;
-            }
-
-            return changesScale || (hasValue && depthStencil.ScaleMode != TextureScaleMode.Blacklisted && depthStencil.ScaleFactor != GraphicsConfig.ResScale);
-        }
-
-        /// <summary>
         /// Commits bindings on the compute pipeline.
         /// </summary>
         public void CommitComputeBindings()
@@ -340,10 +340,11 @@ namespace Ryujinx.Graphics.Gpu.Image
         /// </summary>
         /// <param name="state">Current GPU state</param>
         /// <param name="handle">Shader "fake" handle of the texture</param>
+        /// <param name="cbufSlot">Shader constant buffer slot of the texture</param>
         /// <returns>The texture descriptor</returns>
-        public TextureDescriptor GetComputeTextureDescriptor(GpuState state, int handle)
+        public TextureDescriptor GetComputeTextureDescriptor(GpuState state, int handle, int cbufSlot)
         {
-            return _cpBindingsManager.GetTextureDescriptor(state, 0, handle);
+            return _cpBindingsManager.GetTextureDescriptor(state, 0, handle, cbufSlot);
         }
 
         /// <summary>
@@ -352,10 +353,11 @@ namespace Ryujinx.Graphics.Gpu.Image
         /// <param name="state">Current GPU state</param>
         /// <param name="stageIndex">Index of the shader stage where the texture is bound</param>
         /// <param name="handle">Shader "fake" handle of the texture</param>
+        /// <param name="cbufSlot">Shader constant buffer slot of the texture</param>
         /// <returns>The texture descriptor</returns>
-        public TextureDescriptor GetGraphicsTextureDescriptor(GpuState state, int stageIndex, int handle)
+        public TextureDescriptor GetGraphicsTextureDescriptor(GpuState state, int stageIndex, int handle, int cbufSlot)
         {
-            return _gpBindingsManager.GetTextureDescriptor(state, stageIndex, handle);
+            return _gpBindingsManager.GetTextureDescriptor(state, stageIndex, handle, cbufSlot);
         }
 
         /// <summary>
@@ -474,11 +476,12 @@ namespace Ryujinx.Graphics.Gpu.Image
         /// Tries to find an existing texture, or create a new one if not found.
         /// </summary>
         /// <param name="copyTexture">Copy texture to find or create</param>
+        /// <param name="offset">Offset to be added to the physical texture address</param>
         /// <param name="formatInfo">Format information of the copy texture</param>
         /// <param name="preferScaling">Indicates if the texture should be scaled from the start</param>
         /// <param name="sizeHint">A hint indicating the minimum used size for the texture</param>
         /// <returns>The texture</returns>
-        public Texture FindOrCreateTexture(CopyTexture copyTexture, FormatInfo formatInfo, bool preferScaling = true, Size? sizeHint = null)
+        public Texture FindOrCreateTexture(CopyTexture copyTexture, ulong offset, FormatInfo formatInfo, bool preferScaling = true, Size? sizeHint = null)
         {
             int gobBlocksInY = copyTexture.MemoryLayout.UnpackGobBlocksInY();
             int gobBlocksInZ = copyTexture.MemoryLayout.UnpackGobBlocksInZ();
@@ -495,7 +498,7 @@ namespace Ryujinx.Graphics.Gpu.Image
             }
 
             TextureInfo info = new TextureInfo(
-                copyTexture.Address.Pack(),
+                copyTexture.Address.Pack() + offset,
                 width,
                 copyTexture.Height,
                 copyTexture.Depth,
@@ -716,7 +719,7 @@ namespace Ryujinx.Graphics.Gpu.Image
                     // If they don't, it may still be mapped to the same physical region, so we
                     // do a more expensive check to tell if they are mapped into the same physical regions.
                     // If the GPU VA for the texture has ever been unmapped, then the range must be checked regardless.
-                    if ((overlap.Info.GpuAddress != info.GpuAddress || overlap.ChangedMapping) && 
+                    if ((overlap.Info.GpuAddress != info.GpuAddress || overlap.ChangedMapping) &&
                         !_context.MemoryManager.CompareRange(overlap.Range, info.GpuAddress))
                     {
                         continue;
@@ -775,7 +778,7 @@ namespace Ryujinx.Graphics.Gpu.Image
                 Array.Resize(ref _overlapInfo, _textureOverlaps.Length);
             }
 
-            // =============== Find Texture View of Existing Texture =============== 
+            // =============== Find Texture View of Existing Texture ===============
 
             int fullyCompatible = 0;
 
@@ -841,7 +844,7 @@ namespace Ryujinx.Graphics.Gpu.Image
             if (texture != null)
             {
                 // This texture could be a view of multiple parent textures with different storages, even if it is a view.
-                // When a texture is created, make sure all possible dependencies to other textures are created as copies. 
+                // When a texture is created, make sure all possible dependencies to other textures are created as copies.
                 // (even if it could be fulfilled without a copy)
 
                 for (int index = 0; index < overlapsCount; index++)
@@ -859,7 +862,7 @@ namespace Ryujinx.Graphics.Gpu.Image
                 texture.SynchronizeMemory();
             }
 
-            // =============== Create a New Texture =============== 
+            // =============== Create a New Texture ===============
 
             // No match, create a new texture.
             if (texture == null)
@@ -993,7 +996,7 @@ namespace Ryujinx.Graphics.Gpu.Image
                         overlap.ReplaceView(texture, overlapInfo, newView, oInfo.FirstLayer, oInfo.FirstLevel);
                     }
                 }
-                
+
                 texture.SynchronizeMemory();
             }
 
